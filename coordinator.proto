@@ -1,0 +1,102 @@
+syntax = "proto3";
+package csce438;
+import "google/protobuf/timestamp.proto";
+
+// ------------------------------------------------------------
+// The coordinator service definition
+// These are the different functionalities exposed by service
+// ------------------------------------------------------------
+
+//Init and Heartbeat potentially redundant
+service CoordService{
+    rpc Heartbeat (ServerInfo) returns (Confirmation) {}
+    rpc GetServer (ID) returns (ServerInfo) {}
+    // Get the Slave server info for a given cluster (Master queries this)
+    rpc GetSlave (ID) returns (ServerInfo) {}
+    // Manual synchronizer failover: demote current Master sync and promote Slave sync
+    rpc PromoteSynchronizer (ID) returns (Confirmation) {}
+    // Get all follower synchronizers for a given synchronizer
+    rpc GetAllFollowerServers (ID) returns (ServerList) {}
+    // Get list of all active synchronizers (Master and Slave)
+    rpc GetSynchronizers (ID) returns (ServerList) {}
+    // ZooKeeper API here
+    // Create a path and place data in the znode
+    rpc create (PathAndData) returns (Status) {}
+    // Check if a path exists (checking if a Master is elected
+    rpc exists (Path) returns (Status) {}
+}
+
+//server info message definition
+message ServerInfo{
+    int32 serverID = 1;
+    string hostname = 2;
+    string port = 3;
+    string type = 4;
+    int32 clusterID = 5;
+}
+
+//confirmation message definition
+message Confirmation{
+    bool status = 1;
+    bool isMaster = 2;  // Coordinator tells server if it's Master or Slave
+}
+
+//id message definition
+message ID{
+    int32 id = 1;
+}
+
+
+// ServerList definition
+message ServerList{
+    repeated int32 serverID = 1;
+    repeated string hostname = 2;
+    repeated string port = 3;
+    repeated string type = 4;
+}
+
+
+// PathAndData definition for rpc create
+message PathAndData{
+    string path = 1;
+    string data = 2;
+}
+
+// path definition for rpc exists
+message Path{
+    string path = 1;
+}
+
+// status definition for rpc exists and create
+message Status{
+    bool status = 1;
+}
+
+// TLFL definition
+message TLFL{
+    bool status = 1;
+    repeated string TL = 2;
+    repeated string FL = 3;
+}
+
+// AllUsers definition
+message AllUsers{
+    repeated string users = 1;
+}
+
+// SynchronizerListReply definition
+message SynchronizerListReply {
+    repeated string all_users = 1;
+    repeated string followers = 2;
+}
+
+// SynchService definition
+service SynchService{
+    rpc GetAllUsers(Confirmation) returns (AllUsers) {}
+    rpc GetFollowersOfClient(ID) returns (AllUsers) {}
+    rpc GetTLFL(ID) returns (TLFL) {}
+    rpc ResynchServer(ServerInfo) returns (Confirmation) {}
+    rpc SynchronizerList(ID) returns (SynchronizerListReply) {}
+}
+
+

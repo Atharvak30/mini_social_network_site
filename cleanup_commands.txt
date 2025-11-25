@@ -1,0 +1,66 @@
+===============================================
+SNS DISTRIBUTED SYSTEM - CLEANUP COMMANDS
+===============================================
+
+STEP 1: Kill all processes
+---------------------------
+pkill -9 tsd
+pkill -9 synchronizer
+pkill -9 coordinator
+pkill -9 tsc
+
+
+STEP 2: Verify processes are killed
+------------------------------------
+ps aux | grep -E 'tsd|synchronizer|coordinator' | grep -v grep
+
+(Should show nothing. If processes still exist, repeat Step 1)
+
+
+STEP 3: Remove cluster directories and files
+---------------------------------------------
+rm -rf cluster_*
+rm -f *.txt
+
+
+STEP 4: Clean semaphores (macOS)
+---------------------------------
+# Check for semaphore files
+ls -la /tmp/sem.* 2>/dev/null
+ls -la /var/tmp/sem.* 2>/dev/null
+
+# Remove semaphore files if they exist
+rm -f /tmp/sem.*
+rm -f /var/tmp/sem.*
+
+
+STEP 5: Clear RabbitMQ queues (optional but recommended)
+---------------------------------------------------------
+# List all queues
+sudo rabbitmqctl list_queues
+
+# Option A: Delete all queues manually
+# (Replace QUEUE_NAME with actual queue name from list)
+sudo rabbitmqctl delete_queue QUEUE_NAME
+
+# Option B: Reset RabbitMQ completely (nuclear option)
+sudo rabbitmqctl stop_app
+sudo rabbitmqctl reset
+sudo rabbitmqctl start_app
+
+# Option C: Restart RabbitMQ service
+brew services restart rabbitmq
+
+
+STEP 6: Rebuild project
+-----------------------
+make clean
+make
+
+
+NOTES:
+------
+- On macOS, persistent semaphores are difficult to clean without a reboot
+- If issues persist after running all commands, consider rebooting
+- Always run Step 1-3 between test runs to ensure clean state
+- RabbitMQ queue cleanup is important if you see stale messages
