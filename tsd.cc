@@ -880,9 +880,52 @@ class SNSServiceImpl final : public SNSService::Service {
 
     // Send last 20 messages to user FIRST
     int start_idx = std::max(0, (int)initial_timeline.size() - 20);
+
+    // Track sent messages to prevent duplicates (use set of message signatures)
+    std::set<std::string> sent_messages;
     for (int i = start_idx; i < initial_timeline.size(); i++) {
         stream->Write(initial_timeline[i]);
+        // Create unique signature: timestamp + username + message
+        std::string signature = std::to_string(initial_timeline[i].timestamp().seconds()) + "|" +
+                                initial_timeline[i].username() + "|" +
+                                initial_timeline[i].msg();
+        sent_messages.insert(signature);
     }
+
+    // Section 3.5: Start background thread to monitor timeline files for updates from synchronizer
+    std::atomic<bool> keep_monitoring(true);
+    std::mutex sent_messages_mutex;  // Protect sent_messages set
+
+    std::thread file_monitor_thread([&]() {
+        while (keep_monitoring) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));  // Check every 2 seconds
+
+            // Re-read following list (in case it changed)
+            std::vector<std::string> current_following = readUsersFromFile(followingFile, followingSem);
+
+            // Check each followed user's timeline file for new posts
+            for (const auto& followed_username : current_following) {
+                std::vector<Message> all_messages = readTimelineFile(followed_username, 100, 0);  // Read up to 100 recent messages
+
+                // Send any messages we haven't seen before
+                for (const auto& msg : all_messages) {
+                    std::string signature = std::to_string(msg.timestamp().seconds()) + "|" +
+                                            msg.username() + "|" +
+                                            msg.msg();
+
+                    std::lock_guard<std::mutex> lock(sent_messages_mutex);
+                    if (sent_messages.find(signature) == sent_messages.end()) {
+                        // New message! Send it to the user
+                        if (user->stream != nullptr) {
+                            user->stream->Write(msg);
+                            sent_messages.insert(signature);
+                            log(INFO, "File monitor pushed update from " + followed_username + " to " + username);
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     // Section 4: Check if initial message has content (is a real post)
     if (!initial_message.msg().empty()) {
@@ -925,6 +968,12 @@ class SNSServiceImpl final : public SNSService::Service {
 
             if (follower_client != nullptr && follower_client->stream != nullptr) {
                 follower_client->stream->Write(initial_message);
+                // Track this message to prevent duplicate from file monitor
+                std::string signature = std::to_string(initial_message.timestamp().seconds()) + "|" +
+                                        initial_message.username() + "|" +
+                                        initial_message.msg();
+                std::lock_guard<std::mutex> lock(sent_messages_mutex);
+                sent_messages.insert(signature);
             }
         }
     }

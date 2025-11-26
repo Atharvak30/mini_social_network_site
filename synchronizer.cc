@@ -326,6 +326,7 @@ public:
             std::string queueName =
                 "synch" + std::to_string(target) + "_clients_relations_queue";
 
+            log(INFO, "ABOUT TO PUBLISH CLIENT RELATIONS to queue: " + queueName + " | Message: " + message.substr(0, 200));
             publishMessage(queueName, message);
             log(INFO, "Published snapshot to " + queueName);
         }
@@ -612,104 +613,156 @@ public:
     //  periodically to the message queue of the synchronizer responsible for that client
     void publishTimelines()
     {
+        log(INFO, ">>> publishTimelines() CALLED, synchID=" + std::to_string(synchID) + ", isMaster=" + std::to_string(isMaster));
+
         // Only Master synchronizers publish to RabbitMQ
         if (!isMaster) {
+            log(INFO, ">>> publishTimelines() EARLY RETURN: Not Master");
             return;
         }
 
-        // Static map to track last published line for each user
-        static std::map<std::string, int> lastPublishedLine;
-
         std::vector<std::string> users = get_all_users_func(synchID);
+        log(INFO, ">>> publishTimelines() Got " + std::to_string(users.size()) + " users");
+
+        // Get list of all synchronizers from coordinator
+        ClientContext context;
+        ID request;
+        request.set_id(0);
+        ServerList serverList;
+        Status status = coordinator_stub_->GetSynchronizers(&context, request, &serverList);
+
+        if (!status.ok()) {
+            log(ERROR, "Failed to get synchronizer list: " + status.error_message());
+            return;
+        }
+
+        // Calculate paired synchronizer ID (skip our own queue and paired sync queue)
+        int pairedSyncID = (synchID <= 3) ? (synchID + 3) : (synchID - 3);
 
         for (const auto &client : users)
         {
             int clientId = std::stoi(client);
             int client_cluster = ((clientId - 1) % 3) + 1;
+            log(INFO, ">>> Checking user " + client + ", cluster=" + std::to_string(client_cluster) + ", myCluster=" + std::to_string(clusterID));
             // only do this for clients in your own cluster
             if (client_cluster != clusterID)
             {
+                log(INFO, ">>> SKIP user " + client + ": wrong cluster");
                 continue;
             }
 
+            // Get ENTIRE timeline (no incremental tracking)
             std::vector<std::string> timeline = get_tl_or_fl(synchID, clientId, true);
+            log(INFO, ">>> User " + client + " has timeline size: " + std::to_string(timeline.size()));
 
-            // Get the last published line index for this user (default to 0)
-            int lastLine = lastPublishedLine[client];
-
-            // If there are no new timeline updates, skip this user
-            if (lastLine >= timeline.size()) {
+            // Skip if timeline is empty
+            if (timeline.empty()) {
+                log(INFO, ">>> SKIP user " + client + ": empty timeline");
                 continue;
             }
 
-            // Extract only the new timeline lines since last publish
-            std::vector<std::string> newTimelineLines;
-            for (int i = lastLine; i < timeline.size(); i++) {
-                newTimelineLines.push_back(timeline[i]);
+            // SIMPLIFIED APPROACH: Publish to ALL synchronizers (not filtering by followers)
+            // Create JSON message with poster and COMPLETE timeline snapshot
+            Json::Value message;
+            message["poster"] = client;
+
+            Json::Value timelineArray(Json::arrayValue);
+            for (const auto &line : timeline) {
+                timelineArray.append(line);
             }
+            message["timeline_updates"] = timelineArray;
 
-            // Update the last published line index
-            lastPublishedLine[client] = timeline.size();
+            // Empty followers array (we're broadcasting to everyone)
+            Json::Value followersArray(Json::arrayValue);
+            message["followers"] = followersArray;
 
-            // Get followers of this user
-            std::vector<std::string> followers = getFollowersOfUser(clientId);
+            Json::FastWriter writer;
+            std::string jsonMessage = writer.write(message);
 
-            // Group followers by their cluster
-            std::map<int, std::vector<std::string>> followersByCluster;
+            // Publish to ALL synchronizers except our own and our paired sync
+            int publishCount = 0;
+            for (int i = 0; i < serverList.serverid_size(); i++) {
+                int targetSyncID = serverList.serverid(i);
 
-            for (const auto &follower : followers)
-            {
-                int followerId = std::stoi(follower);
-                int followerCluster = ((followerId - 1) % 3) + 1;
-
-                // Skip followers in our own cluster (they already have the timeline file)
-                if (followerCluster == clusterID) {
+                // Skip our own queue and our paired synchronizer's queue
+                if (targetSyncID == synchID || targetSyncID == pairedSyncID) {
                     continue;
                 }
 
-                followersByCluster[followerCluster].push_back(follower);
+                std::string queueName = "synch" + std::to_string(targetSyncID) + "_timeline_queue";
+                log(INFO, "ABOUT TO PUBLISH TIMELINE to queue: " + queueName + " | Message: " + jsonMessage.substr(0, 200));
+                publishMessage(queueName, jsonMessage);
+                log(INFO, "Published timeline from user " + client + " to queue: " + queueName);
+                publishCount++;
             }
 
-            // Publish to both Master and Slave synchronizers for each target cluster
-            for (const auto &entry : followersByCluster) {
-                int targetCluster = entry.first;
-                const std::vector<std::string> &targetFollowers = entry.second;
+            log(INFO, "Published user " + client + " timeline to " + std::to_string(publishCount) + " synchronizer queues");
 
-                // Create JSON message with poster and new timeline updates
-                Json::Value message;
-                message["poster"] = client;
-
-                Json::Value timelineArray(Json::arrayValue);
-                for (const auto &line : newTimelineLines) {
-                    timelineArray.append(line);
-                }
-                message["timeline_updates"] = timelineArray;
-
-                Json::Value followersArray(Json::arrayValue);
-                for (const auto &follower : targetFollowers) {
-                    followersArray.append(follower);
-                }
-                message["followers"] = followersArray;
-
-                Json::FastWriter writer;
-                std::string jsonMessage = writer.write(message);
-
-                // Publish to BOTH Master and Slave synchronizers for this cluster
-                // Master synch ID = cluster ID (1, 2, 3)
-                int masterSyncID = targetCluster;
-                // Slave synch ID = cluster ID + 3 (4, 5, 6)
-                int slaveSyncID = targetCluster + 3;
-
-                // Publish to Master synchronizer
-                std::string masterQueueName = "synch" + std::to_string(masterSyncID) + "_timeline_queue";
-                publishMessage(masterQueueName, jsonMessage);
-                log(INFO, "Published timeline updates from user " + client + " to Master queue: " + masterQueueName + " for " + std::to_string(targetFollowers.size()) + " followers");
-
-                // Publish to Slave synchronizer
-                std::string slaveQueueName = "synch" + std::to_string(slaveSyncID) + "_timeline_queue";
-                publishMessage(slaveQueueName, jsonMessage);
-                log(INFO, "Published timeline updates from user " + client + " to Slave queue: " + slaveQueueName + " for " + std::to_string(targetFollowers.size()) + " followers");
-            }
+            // OLD FOLLOWER-BASED APPROACH (COMMENTED OUT)
+            // // Get followers of this user
+            // std::vector<std::string> followers = getFollowersOfUser(clientId);
+            // log(INFO, ">>> User " + client + " has " + std::to_string(followers.size()) + " followers");
+            //
+            // // Group followers by their cluster
+            // std::map<int, std::vector<std::string>> followersByCluster;
+            //
+            // for (const auto &follower : followers)
+            // {
+            //     int followerId = std::stoi(follower);
+            //     int followerCluster = ((followerId - 1) % 3) + 1;
+            //
+            //     // Skip followers in our own cluster (they already have the timeline file)
+            //     if (followerCluster == clusterID) {
+            //         continue;
+            //     }
+            //
+            //     followersByCluster[followerCluster].push_back(follower);
+            // }
+            //
+            // log(INFO, ">>>>>>> User " + client + " has followers in " + std::to_string(followersByCluster.size()) + " other clusters");
+            //
+            // // Publish to both Master and Slave synchronizers for each target cluster
+            // for (const auto &entry : followersByCluster) {
+            //     int targetCluster = entry.first;
+            //     const std::vector<std::string> &targetFollowers = entry.second;
+            //
+            //     // Create JSON message with poster and COMPLETE timeline snapshot
+            //     Json::Value message;
+            //     message["poster"] = client;
+            //
+            //     Json::Value timelineArray(Json::arrayValue);
+            //     for (const auto &line : timeline) {
+            //         timelineArray.append(line);
+            //     }
+            //     message["timeline_updates"] = timelineArray;
+            //
+            //     Json::Value followersArray(Json::arrayValue);
+            //     for (const auto &follower : targetFollowers) {
+            //         followersArray.append(follower);
+            //     }
+            //     message["followers"] = followersArray;
+            //
+            //     Json::FastWriter writer;
+            //     std::string jsonMessage = writer.write(message);
+            //
+            //     // Publish to BOTH Master and Slave synchronizers for this cluster
+            //     // Master synch ID = cluster ID (1, 2, 3)
+            //     int masterSyncID = targetCluster;
+            //     // Slave synch ID = cluster ID + 3 (4, 5, 6)
+            //     int slaveSyncID = targetCluster + 3;
+            //
+            //     // Publish to Master synchronizer
+            //     std::string masterQueueName = "synch" + std::to_string(masterSyncID) + "_timeline_queue";
+            //     log(INFO, "ABOUT TO PUBLISH TIMELINE to queue: " + masterQueueName + " | Message: " + jsonMessage.substr(0, 200));
+            //     publishMessage(masterQueueName, jsonMessage);
+            //     log(INFO, "Published timeline updates from user " + client + " to Master queue: " + masterQueueName + " for " + std::to_string(targetFollowers.size()) + " followers");
+            //
+            //     // Publish to Slave synchronizer
+            //     std::string slaveQueueName = "synch" + std::to_string(slaveSyncID) + "_timeline_queue";
+            //     log(INFO, "ABOUT TO PUBLISH TIMELINE to queue: " + slaveQueueName + " | Message: " + jsonMessage.substr(0, 200));
+            //     publishMessage(slaveQueueName, jsonMessage);
+            //     log(INFO, "Published timeline updates from user " + client + " to Slave queue: " + slaveQueueName + " for " + std::to_string(targetFollowers.size()) + " followers");
+            // }
         }
     }
 
@@ -722,9 +775,12 @@ public:
         while (true) {
             std::string message = consumeMessage(queueName, 1000); // 1 second timeout
 
+        
             if (message.empty()) {
                 break; // No more messages in queue
             }
+            log(INFO, "TIMELINE MESSAGE ----| Raw message: " + message);
+
 
             // Parse JSON message
             // Expected format: {"poster": "1", "timeline_updates": ["T 123", "U 1", "W Hello", ""], "followers": ["5", "8"]}
@@ -789,8 +845,8 @@ public:
             // Acquire semaphore lock
             sem_wait(fileSem);
 
-            // Append timeline updates to the local copy of poster's timeline file
-            std::ofstream file(timelineFile, std::ios::app);
+            // OVERWRITE timeline file with complete snapshot from poster
+            std::ofstream file(timelineFile, std::ios::trunc);
             if (file.is_open()) {
                 for (const auto& line : timelineUpdates) {
                     file << line << std::endl;
@@ -804,12 +860,11 @@ public:
                     if (i < followers.size() - 1) followerList += ", ";
                 }
 
-                log(INFO, "Appended " + std::to_string(timelineUpdates.size()) +
-                          " lines to timeline file for user " + poster +
-                          " (consumed from " + queueName + ")" +
+                log(INFO, "Overwrote timeline file for user " + poster + " with " + std::to_string(timelineUpdates.size()) +
+                          " lines (consumed from " + queueName + ")" +
                           " - Followers in this cluster: [" + followerList + "]");
             } else {
-                log(ERROR, "Failed to open timeline file for appending: " + timelineFile);
+                log(ERROR, "Failed to open timeline file for writing: " + timelineFile);
             }
 
             // Release semaphore lock
