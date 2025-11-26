@@ -106,6 +106,7 @@ private:
         amqp_socket_open(socket, hostname.c_str(), port);
         amqp_login(conn, "/", 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, "guest", "guest");
         amqp_channel_open(conn, channel);
+        //amqpl_confirm_select(conn, channel); //RABBIT CHANGE
     }
 
     void declareQueue(const std::string &queueName)
@@ -116,8 +117,10 @@ private:
 
     void publishMessage(const std::string &queueName, const std::string &message)
     {
+        //old rabbit
         amqp_basic_publish(conn, channel, amqp_empty_bytes, amqp_cstring_bytes(queueName.c_str()),
                            0, 0, NULL, amqp_cstring_bytes(message.c_str()));
+
     }
 
     std::string consumeMessage(const std::string &queueName, int timeout_ms = 5000)
@@ -433,6 +436,7 @@ public:
 
         while (true)
         {
+            log(INFO, "Entering consume loop " )
             std::string message = consumeMessage(queueName, 1000);
             if (message.empty()) break;
 
@@ -713,10 +717,15 @@ public:
     void consumeTimelines()
     {
         std::string queueName = "synch" + std::to_string(synchID) + "_timeline_queue";
-        std::string message = consumeMessage(queueName, 1000); // 1 second timeout
 
-        if (!message.empty())
-        {
+        // Consume ALL available messages from queue (like consumeClientRelations does)
+        while (true) {
+            std::string message = consumeMessage(queueName, 1000); // 1 second timeout
+
+            if (message.empty()) {
+                break; // No more messages in queue
+            }
+
             // Parse JSON message
             // Expected format: {"poster": "1", "timeline_updates": ["T 123", "U 1", "W Hello", ""], "followers": ["5", "8"]}
             Json::Value root;
@@ -725,14 +734,14 @@ public:
             std::istringstream messageStream(message);
 
             if (!Json::parseFromStream(readerBuilder, messageStream, &root, &errs)) {
-                log(ERROR, "Failed to parse timeline message: " + errs);
-                return;
+                log(ERROR, "Failed to parse timeline message: " + errs + " | Raw message: " + message.substr(0, 100));
+                continue; // Skip this message and process next one
             }
 
             // Extract poster ID
             if (!root.isMember("poster") || !root.isMember("timeline_updates")) {
-                log(ERROR, "Timeline message missing required fields");
-                return;
+                log(ERROR, "Timeline message missing required fields member not in root| Raw message: " + message.substr(0, 100));
+                continue; // Skip this message and process next one
             }
 
             std::string poster = root["poster"].asString();
@@ -747,7 +756,7 @@ public:
 
             if (timelineUpdates.empty()) {
                 log(INFO, "No timeline updates to consume for poster: " + poster);
-                return;
+                continue; // Skip this message and process next one
             }
 
             // Extract followers (for logging purposes)
@@ -774,7 +783,7 @@ public:
 
             if (fileSem == SEM_FAILED) {
                 log(ERROR, "Failed to open semaphore " + semName + " for timeline file: " + timelineFile);
-                return;
+                continue; // Skip this message and process next one
             }
 
             // Acquire semaphore lock
@@ -860,15 +869,14 @@ void RunServer(std::string coordIP, std::string coordPort, std::string port_no, 
 
     std::thread t1(run_synchronizer, coordIP, coordPort, port_no, synchID, std::ref(rabbitMQ));
 
-    // Create a consumer thread
+    // Create a consumer thread for user lists, client relations, and timelines
     std::thread consumerThread([&rabbitMQ]()
                                {
         while (true) {
             rabbitMQ.consumeUserLists();
             rabbitMQ.consumeClientRelations();
-            //rabbitMQ.consumeTimelines();
+            rabbitMQ.consumeTimelines();
             std::this_thread::sleep_for(std::chrono::seconds(5));
-            // you can modify this sleep period as per your choice
         } });
 
     server->Wait();
@@ -1000,7 +1008,7 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
         rabbitMQ.publishClientRelations();
 
         // Publish timelines
-        //rabbitMQ.publishTimelines();
+        rabbitMQ.publishTimelines();
     }
     return;
 }
@@ -1116,8 +1124,8 @@ std::vector<std::string> get_tl_or_fl(int synchID, int clientID, bool tl)
     std::string slave_fn = "cluster_" + std::to_string(clusterID) + "/2/" + std::to_string(clientID);
     if (tl)
     {
-        master_fn.append("_timeline.txt");
-        slave_fn.append("_timeline.txt");
+        master_fn.append(".txt");
+        slave_fn.append(".txt");
     }
     else
     {

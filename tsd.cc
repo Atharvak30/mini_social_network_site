@@ -340,9 +340,28 @@ void initializeSlaveConnection();
 
 // Helper function to write a message to a user's timeline file
 void writeToTimelineFile(const std::string& username, const Message& message) {
-    std::string filename = g_serverDirectory + username + ".txt";
-    std::ofstream file(filename, std::ios::app);  // Append mode
+    // Determine synchronizer directory based on role
+    std::string syncSubdir = g_isMaster ? "1" : "2";
+    std::string syncDir = "./cluster_" + g_clusterID + "/" + syncSubdir + "/";
+    std::string filename = syncDir + username + ".txt";
 
+    // Create directory if it doesn't exist
+    std::string mkdir_command = "mkdir -p " + syncDir;
+    system(mkdir_command.c_str());
+
+    // Use semaphore for synchronization with synchronizer process
+    std::string semName = "/" + g_clusterID + "_" + syncSubdir + "_" + username + "_timeline";
+    sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+
+    if (fileSem == SEM_FAILED) {
+        log(ERROR, "Failed to open semaphore " + semName + " for " + filename);
+        return;
+    }
+
+    // Acquire semaphore lock
+    sem_wait(fileSem);
+
+    std::ofstream file(filename, std::ios::app);  // Append mode
     if (file.is_open()) {
         file << "T " << message.timestamp().seconds() << std::endl;
         file << "U " << message.username() << std::endl;
@@ -350,15 +369,37 @@ void writeToTimelineFile(const std::string& username, const Message& message) {
         file << std::endl;  // Empty line after each message
         file.close();
     }
+
+    // Release semaphore lock
+    sem_post(fileSem);
+    sem_close(fileSem);
 }
 
 // Helper function to read last N messages from a user's timeline file after a specific timestamp
 std::vector<Message> readTimelineFile(const std::string& username, int max_messages, std::time_t after_time) {
     std::vector<Message> messages;
-    std::string filename = g_serverDirectory + username + ".txt";
-    std::ifstream file(filename);
 
+    // Determine synchronizer directory based on role
+    std::string syncSubdir = g_isMaster ? "1" : "2";
+    std::string syncDir = "./cluster_" + g_clusterID + "/" + syncSubdir + "/";
+    std::string filename = syncDir + username + ".txt";
+
+    // Use semaphore for synchronization with synchronizer process
+    std::string semName = "/" + g_clusterID + "_" + syncSubdir + "_" + username + "_timeline";
+    sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+
+    if (fileSem == SEM_FAILED) {
+        log(ERROR, "Failed to open semaphore " + semName + " for " + filename);
+        return messages;  // Return empty vector if semaphore fails
+    }
+
+    // Acquire semaphore lock
+    sem_wait(fileSem);
+
+    std::ifstream file(filename);
     if (!file.is_open()) {
+        sem_post(fileSem);
+        sem_close(fileSem);
         return messages;  // Return empty vector if file doesn't exist
     }
 
@@ -370,6 +411,10 @@ std::vector<Message> readTimelineFile(const std::string& username, int max_messa
         all_lines.push_back(line);
     }
     file.close();
+
+    // Release semaphore lock
+    sem_post(fileSem);
+    sem_close(fileSem);
 
     // Parse messages from the end (most recent first)
     for (int i = all_lines.size() - 1; i >= 0 && messages.size() < max_messages; ) {
@@ -811,12 +856,17 @@ class SNSServiceImpl final : public SNSService::Service {
     // Section 3: Send initial timeline (last 20 posts from followed users)
     std::vector<Message> initial_timeline;
 
-    // For each user that this user follows
-    for (Client* followed_user : user->client_following) {
-        std::time_t follow_start_time = user->following_since[followed_user->username];
+    // Read who this user follows from the synchronizer file
+    std::string syncSubdir = g_isMaster ? "1" : "2";
+    std::string followingFile = "./cluster_" + g_clusterID + "/" + syncSubdir + "/" + username + "_following.txt";
+    std::string followingSem = "/" + g_clusterID + "_" + syncSubdir + "_" + username + "_following";
 
-        // Read posts from followed_user that were made AFTER follow_start_time
-        std::vector<Message> user_messages = readTimelineFile(followed_user->username, 20, follow_start_time);
+    std::vector<std::string> followingList = readUsersFromFile(followingFile, followingSem);
+
+    // For each user that this user follows (read from file)
+    for (const auto& followed_username : followingList) {
+        // Read posts from followed user (no timestamp filtering since we removed timestamps)
+        std::vector<Message> user_messages = readTimelineFile(followed_username, 20, 0);
 
         // Add to initial timeline
         initial_timeline.insert(initial_timeline.end(), user_messages.begin(), user_messages.end());
@@ -858,10 +908,23 @@ class SNSServiceImpl final : public SNSService::Service {
             }
         }
 
-        // Broadcast to followers
-        for (Client* follower : user->client_followers) {
-            if (follower->stream != nullptr) {  // If follower is in timeline mode
-                follower->stream->Write(initial_message);
+        // Broadcast to followers (read from file)
+        std::string followersFile = "./cluster_" + g_clusterID + "/" + syncSubdir + "/" + username + "_followers.txt";
+        std::string followersSem = "/" + g_clusterID + "_" + syncSubdir + "_" + username + "_followers";
+        std::vector<std::string> followersList = readUsersFromFile(followersFile, followersSem);
+
+        for (const auto& follower_username : followersList) {
+            // Find follower client in memory to check if they have an active stream
+            Client* follower_client = nullptr;
+            for (Client* client : client_db) {
+                if (client->username == follower_username) {
+                    follower_client = client;
+                    break;
+                }
+            }
+
+            if (follower_client != nullptr && follower_client->stream != nullptr) {
+                follower_client->stream->Write(initial_message);
             }
         }
     }
@@ -902,10 +965,23 @@ class SNSServiceImpl final : public SNSService::Service {
             }
         }
 
-        // Broadcast to all followers of the poster
-        for (Client* follower : poster_client->client_followers) {
-            if (follower->stream != nullptr) {  // If follower is in timeline mode
-                follower->stream->Write(incoming_message);
+        // Broadcast to all followers of the poster (read from file)
+        std::string posterFollowersFile = "./cluster_" + g_clusterID + "/" + syncSubdir + "/" + poster + "_followers.txt";
+        std::string posterFollowersSem = "/" + g_clusterID + "_" + syncSubdir + "_" + poster + "_followers";
+        std::vector<std::string> posterFollowersList = readUsersFromFile(posterFollowersFile, posterFollowersSem);
+
+        for (const auto& follower_username : posterFollowersList) {
+            // Find follower client in memory to check if they have an active stream
+            Client* follower_client = nullptr;
+            for (Client* client : client_db) {
+                if (client->username == follower_username) {
+                    follower_client = client;
+                    break;
+                }
+            }
+
+            if (follower_client != nullptr && follower_client->stream != nullptr) {
+                follower_client->stream->Write(incoming_message);
             }
         }
     }
