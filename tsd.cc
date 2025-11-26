@@ -968,12 +968,6 @@ class SNSServiceImpl final : public SNSService::Service {
 
             if (follower_client != nullptr && follower_client->stream != nullptr) {
                 follower_client->stream->Write(initial_message);
-                // Track this message to prevent duplicate from file monitor
-                std::string signature = std::to_string(initial_message.timestamp().seconds()) + "|" +
-                                        initial_message.username() + "|" +
-                                        initial_message.msg();
-                std::lock_guard<std::mutex> lock(sent_messages_mutex);
-                sent_messages.insert(signature);
             }
         }
     }
