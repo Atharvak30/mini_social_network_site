@@ -201,12 +201,11 @@ public:
 
             std::string queueName = "synch" + std::to_string(targetSyncID) + "_users_queue";
             publishMessage(queueName, message);
-            log(INFO, "Published to queue: " + queueName);
+            //log(INFO, "Published to queue: " + queueName);
             publishCount++;
         }
+        //log(INFO, "Published user list to " + std::to_string(publishCount) + " synchronizers");
 
-        log(INFO, "Published user list (" + message  + " users) to " +
-                  std::to_string(publishCount) + " synchronizer queues");
     }
 
     void consumeUserLists()
@@ -215,8 +214,6 @@ public:
 
         // Consume from OUR OWN queue (where other synchronizers published TO us)
         std::string myQueueName = "synch" + std::to_string(synchID) + "_users_queue";
-
-        log(INFO, "Consuming user lists from own queue: " + myQueueName);
 
         int messageCount = 0;
         // Consume all available messages from our queue until empty
@@ -240,22 +237,16 @@ public:
             }
         }
 
-        log(INFO, "Consumed " + std::to_string(messageCount) + " messages with " +
-                  std::to_string(allUsers.size()) + " total users from other synchronizers");
-
         updateAllUsersFile(allUsers);
     }
 
     void publishClientRelations()
     {
-        // Only Master synchronizers publish to RabbitMQ
-        if (!isMaster) {
-            return;
-        }
+        if (!isMaster) return;
 
-        Json::Value relations;
+        Json::Value relations(Json::objectValue);
 
-        // Scan all *_followers.txt files in the cluster directory
+        // Scan ALL *_followers.txt files in the directory (not just local users)
         // This includes users from other clusters who are followed by users in this cluster
         std::string directory = "cluster_" + std::to_string(clusterID) + "/" + clusterSubdirectory + "/";
 
@@ -289,7 +280,6 @@ public:
                 std::string line;
                 while (std::getline(file, line)) {
                     if (!line.empty()) {
-                        // Just read the username directly (no timestamp parsing needed)
                         followerList.append(line);
                     }
                 }
@@ -299,159 +289,319 @@ public:
             sem_post(fileSem);
             sem_close(fileSem);
 
-            if (!followerList.empty()) {
-                relations[username] = followerList;
-            }
+            // Include ALL users (even with empty follower lists)
+            relations[username] = followerList;
         }
 
         globfree(&glob_result);
 
-        Json::FastWriter writer;
-        std::string message = writer.write(relations);
+        // Write JSON snapshot
+        Json::StreamWriterBuilder builder;
+        builder["indentation"] = ""; // compact JSON
+        std::string message = Json::writeString(builder, relations);
+        log(INFO, "Publishing client relations snapshot JSON: " + message);
 
-        // Get synchronizer list from coordinator and publish to other clusters
+        // Send to other synchronizers
         ClientContext context;
         ID request;
-        request.set_id(0);  // ID parameter not used
+        request.set_id(0);
         ServerList serverList;
 
         Status status = coordinator_stub_->GetSynchronizers(&context, request, &serverList);
-
         if (!status.ok()) {
-            log(ERROR, "Failed to get synchronizer list from coordinator: " + status.error_message());
+            log(ERROR, "Failed to get synchronizer list: " + status.error_message());
             return;
         }
 
-        // Calculate our paired synchronizer ID (Master <-> Slave in same cluster)
         int pairedSyncID = (synchID <= 3) ? (synchID + 3) : (synchID - 3);
 
-        // Publish to all synchronizer queues except our own and our paired sync
-        int publishCount = 0;
         for (int i = 0; i < serverList.serverid_size(); i++) {
-            int targetSyncID = serverList.serverid(i);
+            int target = serverList.serverid(i);
 
-            // Skip our own queue and our paired synchronizer's queue
-            if (targetSyncID == synchID || targetSyncID == pairedSyncID) {
-                continue;
-            }
+            if (target == synchID || target == pairedSyncID) continue;
 
-            std::string queueName = "synch" + std::to_string(targetSyncID) + "_clients_relations_queue";
+            std::string queueName =
+                "synch" + std::to_string(target) + "_clients_relations_queue";
+
             publishMessage(queueName, message);
-            log(INFO, "Published client relations to queue: " + queueName);
-            publishCount++;
+            log(INFO, "Published snapshot to " + queueName);
         }
-
-        log(INFO, "Published client relations to " + std::to_string(publishCount) + " synchronizer queues");
     }
+
+    // void publishClientRelations()
+    // {
+    //     // Only Master synchronizers publish to RabbitMQ
+    //     if (!isMaster) {
+    //         return;
+    //     }
+
+    //     Json::Value relations;
+
+    //     // Scan all *_followers.txt files in the cluster directory
+    //     // This includes users from other clusters who are followed by users in this cluster
+    //     std::string directory = "cluster_" + std::to_string(clusterID) + "/" + clusterSubdirectory + "/";
+
+    //     // Use glob to find all _followers.txt files
+    //     glob_t glob_result;
+    //     std::string pattern = directory + "*_followers.txt";
+    //     glob(pattern.c_str(), GLOB_TILDE, NULL, &glob_result);
+
+    //     for (size_t i = 0; i < glob_result.gl_pathc; ++i) {
+    //         std::string filepath = glob_result.gl_pathv[i];
+
+    //         // Extract username from filename (remove path and "_followers.txt")
+    //         size_t lastSlash = filepath.find_last_of("/");
+    //         std::string filename = (lastSlash != std::string::npos) ? filepath.substr(lastSlash + 1) : filepath;
+    //         std::string username = filename.substr(0, filename.find("_followers.txt"));
+
+    //         // Read followers from this file
+    //         std::string semName = "/" + std::to_string(clusterID) + "_" + clusterSubdirectory + "_" + username + "_followers";
+    //         sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+
+    //         if (fileSem == SEM_FAILED) {
+    //             log(ERROR, "Failed to open semaphore for " + filepath);
+    //             continue;
+    //         }
+
+    //         sem_wait(fileSem);
+
+    //         Json::Value followerList(Json::arrayValue);
+    //         std::ifstream file(filepath);
+    //         if (file.is_open()) {
+    //             std::string line;
+    //             while (std::getline(file, line)) {
+    //                 if (!line.empty()) {
+    //                     // Just read the username directly (no timestamp parsing needed)
+    //                     followerList.append(line);
+    //                 }
+    //             }
+    //             file.close();
+    //         }
+
+    //         sem_post(fileSem);
+    //         sem_close(fileSem);
+
+    //         if (!followerList.empty()) {
+    //             relations[username] = followerList;
+    //         }
+    //     }
+
+    //     globfree(&glob_result);
+
+    //     Json::FastWriter writer;
+    //     std::string message = writer.write(relations);
+
+    //     // Get synchronizer list from coordinator and publish to other clusters
+    //     ClientContext context;
+    //     ID request;
+    //     request.set_id(0);  // ID parameter not used
+    //     ServerList serverList;
+
+    //     Status status = coordinator_stub_->GetSynchronizers(&context, request, &serverList);
+
+    //     if (!status.ok()) {
+    //         log(ERROR, "Failed to get synchronizer list from coordinator: " + status.error_message());
+    //         return;
+    //     }
+
+    //     // Calculate our paired synchronizer ID (Master <-> Slave in same cluster)
+    //     int pairedSyncID = (synchID <= 3) ? (synchID + 3) : (synchID - 3);
+
+    //     // Publish to all synchronizer queues except our own and our paired sync
+    //     int publishCount = 0;
+    //     for (int i = 0; i < serverList.serverid_size(); i++) {
+    //         int targetSyncID = serverList.serverid(i);
+
+    //         // Skip our own queue and our paired synchronizer's queue
+    //         if (targetSyncID == synchID || targetSyncID == pairedSyncID) {
+    //             continue;
+    //         }
+
+    //         std::string queueName = "synch" + std::to_string(targetSyncID) + "_clients_relations_queue";
+    //         publishMessage(queueName, message);
+    //         log(INFO, "Published client relations to queue: " + queueName + " message" + message);
+    //         publishCount++;
+    //     }
+    // }
 
     void consumeClientRelations()
     {
         std::vector<std::string> allUsers = get_all_users_func(synchID);
 
-        // Consume from OUR OWN queue (where other synchronizers published TO us)
-        std::string myQueueName = "synch" + std::to_string(synchID) + "_clients_relations_queue";
+        std::string queueName =
+            "synch" + std::to_string(synchID) + "_clients_relations_queue";
 
-        log(INFO, "Consuming client relations from own queue: " + myQueueName);
+        while (true)
+        {
+            std::string message = consumeMessage(queueName, 1000);
+            if (message.empty()) break;
 
-        int messageCount = 0;
-        // Consume all available messages from our queue until empty
-        while (true) {
-            std::string message = consumeMessage(myQueueName, 1000); // 1 second timeout
-
-            if (message.empty()) {
-                break; // No more messages in queue
-            }
-
-            // Parse the JSON message
             Json::Value root;
             Json::Reader reader;
-            if (reader.parse(message, root)) {
-                // Update follower files for clients in our cluster
-                for (const auto &client : allUsers) {
-                    std::string followerFile = "./cluster_" + std::to_string(clusterID) + "/" + clusterSubdirectory + "/" + client + "_followers.txt";
-                    std::string semName = "/" + std::to_string(clusterID) + "_" + clusterSubdirectory + "_" + client + "_followers";
-                    sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
 
-                    if (fileSem == SEM_FAILED) {
-                        log(ERROR, "Failed to open semaphore for " + followerFile);
-                        continue;
-                    }
+            if (!reader.parse(message, root)) {
+                log(ERROR, "Failed to parse JSON message from " + queueName);
+                continue;
+            }
+            log(INFO, "Processing consume message " + message )
 
-                    // Acquire semaphore lock
-                    sem_wait(fileSem);
-
-                    // Read existing followers into a set
-                    std::set<std::string> existingFollowers;
-                    std::ifstream readFile(followerFile);
-                    if (readFile.is_open()) {
-                        std::string line;
-                        while (std::getline(readFile, line)) {
-                            if (!line.empty()) {
-                                // Just read the username directly (no timestamp parsing)
-                                existingFollowers.insert(line);
-                            }
-                        }
-                        readFile.close();
-                    }
-
-                    // Build set of followers from consumed message (the complete authoritative list)
-                    std::set<std::string> consumedFollowers;
-                    if (root.isMember(client)) {
-                        for (const auto &follower : root[client]) {
-                            consumedFollowers.insert(follower.asString());
-                        }
-                    }
-
-                    // Determine what changed
-                    std::set<std::string> followersToAdd;
-                    std::set<std::string> followersToRemove;
-
-                    // Find new followers to add (in consumed but not in existing)
-                    for (const auto &follower : consumedFollowers) {
-                        if (existingFollowers.find(follower) == existingFollowers.end()) {
-                            followersToAdd.insert(follower);
-                        }
-                    }
-
-                    // Find followers to remove (in existing but not in consumed)
-                    for (const auto &follower : existingFollowers) {
-                        if (consumedFollowers.find(follower) == consumedFollowers.end()) {
-                            followersToRemove.insert(follower);
-                        }
-                    }
-
-                    // Only rewrite file if there are changes
-                    if (!followersToAdd.empty() || !followersToRemove.empty()) {
-                        // Rewrite the entire file with the correct follower list
-                        std::ofstream followerStream(followerFile, std::ios::trunc);
-                        if (followerStream.is_open()) {
-                            for (const auto &follower : consumedFollowers) {
-                                followerStream << follower << std::endl;
-                            }
-                            followerStream.close();
-
-                            // Log changes
-                            for (const auto &follower : followersToAdd) {
-                                log(INFO, "Added cross-cluster follower: " + follower + " to " + client + "'s followers file");
-                            }
-                            for (const auto &follower : followersToRemove) {
-                                log(INFO, "Removed cross-cluster follower: " + follower + " from " + client + "'s followers file");
-                            }
-                        }
-                    }
-
-                    // Release semaphore lock
-                    sem_post(fileSem);
-                    sem_close(fileSem);
+            for (const auto &client : allUsers)
+            {
+                if (!root.isMember(client)) {
+                    // Snapshot doesn't include this user → do NOT overwrite
+                    continue;
                 }
-                messageCount++;
-            } else {
-                log(ERROR, "Failed to parse JSON message from queue: " + myQueueName);
+
+                std::set<std::string> newFollowers;
+                for (const auto &entry : root[client]) {
+                    newFollowers.insert(entry.asString());
+                }
+
+                std::string followerFile =
+                    "./cluster_" + std::to_string(clusterID) + "/" +
+                    clusterSubdirectory + "/" + client + "_followers.txt";
+
+                std::string semName = "/" + std::to_string(clusterID) + "_" +
+                                    clusterSubdirectory + "_" + client + "_followers";
+
+                sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+                if (fileSem == SEM_FAILED) {
+                    log(ERROR, "Failed to open semaphore for " + followerFile);
+                    continue;
+                }
+
+                sem_wait(fileSem);
+
+                // Rewrite entire file with new snapshot
+                std::ofstream out(followerFile, std::ios::trunc);
+                if (out.is_open()) {
+                    for (const auto &f : newFollowers)
+                        out << f << "\n";
+                    out.close();
+                }
+
+                sem_post(fileSem);
+                sem_close(fileSem);
+
+                log(INFO, "Synced snapshot into " + client + "_followers.txt");
             }
         }
-
-        log(INFO, "Consumed " + std::to_string(messageCount) + " client relations messages from other synchronizers");
     }
+
+    // void consumeClientRelations()
+    // {
+    //     std::vector<std::string> allUsers = get_all_users_func(synchID);
+
+    //     // Consume from OUR OWN queue (where other synchronizers published TO us)
+    //     std::string myQueueName = "synch" + std::to_string(synchID) + "_clients_relations_queue";
+
+    //     int messageCount = 0;
+    //     // Consume all available messages from our queue until empty
+    //     while (true) {
+    //         std::string message = consumeMessage(myQueueName, 1000); // 1 second timeout
+
+    //         if (message.empty()) {
+    //             break; // No more messages in queue
+    //         }
+
+    //         // Parse the JSON message
+    //         Json::Value root;
+    //         Json::Reader reader;
+    //         if (reader.parse(message, root)) {
+    //             // Update follower files for clients in our cluster
+    //             for (const auto &client : allUsers) {
+    //                 std::string followerFile = "./cluster_" + std::to_string(clusterID) + "/" + clusterSubdirectory + "/" + client + "_followers.txt";
+    //                 std::string semName = "/" + std::to_string(clusterID) + "_" + clusterSubdirectory + "_" + client + "_followers";
+    //                 sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+
+    //                 if (fileSem == SEM_FAILED) {
+    //                     log(ERROR, "Failed to open semaphore for " + followerFile);
+    //                     continue;
+    //                 }
+
+    //                 // Acquire semaphore lock
+    //                 sem_wait(fileSem);
+
+    //                 // Read existing followers into a set
+    //                 std::set<std::string> existingFollowers;
+    //                 bool fileExisted = false;
+    //                 std::ifstream readFile(followerFile);
+    //                 if (readFile.is_open()) {
+    //                     fileExisted = true;
+    //                     std::string line;
+    //                     while (std::getline(readFile, line)) {
+    //                         if (!line.empty()) {
+    //                             // Just read the username directly (no timestamp parsing)
+    //                             existingFollowers.insert(line);
+    //                         }
+    //                     }
+    //                     readFile.close();
+    //                 }
+
+    //                 // Build set of followers from consumed message (the complete authoritative list)
+    //                 std::set<std::string> consumedFollowers;
+    //                 if (root.isMember(client)) {
+    //                     for (const auto &follower : root[client]) {
+    //                         consumedFollowers.insert(follower.asString());
+    //                     }
+    //                 }
+
+    //                 // Determine what changed
+    //                 std::set<std::string> followersToAdd;
+    //                 std::set<std::string> followersToRemove;
+
+    //                 // Find new followers to add (in consumed but not in existing)
+    //                 for (const auto &follower : consumedFollowers) {
+    //                     if (existingFollowers.find(follower) == existingFollowers.end()) {
+    //                         followersToAdd.insert(follower);
+    //                     }
+    //                 }
+
+    //                 // Find followers to remove (in existing but not in consumed)
+    //                 for (const auto &follower : existingFollowers) {
+    //                     if (consumedFollowers.find(follower) == consumedFollowers.end()) {
+    //                         followersToRemove.insert(follower);
+    //                     }
+    //                 }
+
+    //                 // Only rewrite file if there are changes OR if file is new with content
+    //                 if (!followersToAdd.empty() || !followersToRemove.empty()) {
+    //                     // Rewrite the entire file with the correct follower list
+    //                     std::ofstream followerStream(followerFile, std::ios::trunc);
+    //                     if (followerStream.is_open()) {
+    //                         for (const auto &follower : consumedFollowers) {
+    //                             followerStream << follower << std::endl;
+    //                         }
+    //                         followerStream.close();
+
+    //                         // Build follower list string for logging
+    //                         std::string followerList = "";
+    //                         int count = 0;
+    //                         for (const auto &follower : consumedFollowers) {
+    //                             if (count > 0) followerList += ", ";
+    //                             followerList += follower;
+    //                             count++;
+    //                         }
+
+    //                         // Log whether this is a new file or an update
+    //                         if (!fileExisted || existingFollowers.empty()) {
+    //                             log(INFO, "Created " + client + "_followers.txt: [" + followerList + "]");
+    //                         } else {
+    //                             log(INFO, "Updated " + client + "_followers.txt: [" + followerList + "]");
+    //                         }
+    //                     }
+    //                 }
+
+    //                 // Release semaphore lock
+    //                 sem_post(fileSem);
+    //                 sem_close(fileSem);
+    //             }
+    //             messageCount++;
+    //         } else {
+    //             log(ERROR, "Failed to parse JSON message from queue: " + myQueueName);
+    //         }
+    //     }
+    // }
 
     // for every client in your cluster, update all their followers' timeline files
     // by publishing your user's timeline file (or just the new updates in them)
@@ -567,10 +717,95 @@ public:
 
         if (!message.empty())
         {
-            // consume the message from the queue and update the timeline file of the appropriate client with
-            // the new updates to the timeline of the user it follows
+            // Parse JSON message
+            // Expected format: {"poster": "1", "timeline_updates": ["T 123", "U 1", "W Hello", ""], "followers": ["5", "8"]}
+            Json::Value root;
+            Json::CharReaderBuilder readerBuilder;
+            std::string errs;
+            std::istringstream messageStream(message);
 
-            // YOUR CODE HERE
+            if (!Json::parseFromStream(readerBuilder, messageStream, &root, &errs)) {
+                log(ERROR, "Failed to parse timeline message: " + errs);
+                return;
+            }
+
+            // Extract poster ID
+            if (!root.isMember("poster") || !root.isMember("timeline_updates")) {
+                log(ERROR, "Timeline message missing required fields");
+                return;
+            }
+
+            std::string poster = root["poster"].asString();
+
+            // Extract timeline updates (array of strings)
+            std::vector<std::string> timelineUpdates;
+            if (root["timeline_updates"].isArray()) {
+                for (const auto& line : root["timeline_updates"]) {
+                    timelineUpdates.push_back(line.asString());
+                }
+            }
+
+            if (timelineUpdates.empty()) {
+                log(INFO, "No timeline updates to consume for poster: " + poster);
+                return;
+            }
+
+            // Extract followers (for logging purposes)
+            std::vector<std::string> followers;
+            if (root.isMember("followers") && root["followers"].isArray()) {
+                for (const auto& follower : root["followers"]) {
+                    followers.push_back(follower.asString());
+                }
+            }
+
+            // Determine local timeline file path
+            // Format: cluster_{clusterID}/{subdirectory}/{poster}.txt
+            // subdirectory = 1 for Master, 2 for Slave
+            std::string subdirectory = isMaster ? "1" : "2";
+            std::string timelineFile = "./cluster_" + std::to_string(clusterID) + "/" + subdirectory + "/" + poster + ".txt";
+
+            // Create directory if it doesn't exist
+            std::string mkdir_command = "mkdir -p ./cluster_" + std::to_string(clusterID) + "/" + subdirectory;
+            system(mkdir_command.c_str());
+
+            // Use semaphore for file synchronization with TSD
+            std::string semName = "/" + std::to_string(clusterID) + "_" + subdirectory + "_" + poster + "_timeline";
+            sem_t *fileSem = sem_open(semName.c_str(), O_CREAT, 0644, 1);
+
+            if (fileSem == SEM_FAILED) {
+                log(ERROR, "Failed to open semaphore " + semName + " for timeline file: " + timelineFile);
+                return;
+            }
+
+            // Acquire semaphore lock
+            sem_wait(fileSem);
+
+            // Append timeline updates to the local copy of poster's timeline file
+            std::ofstream file(timelineFile, std::ios::app);
+            if (file.is_open()) {
+                for (const auto& line : timelineUpdates) {
+                    file << line << std::endl;
+                }
+                file.close();
+
+                // Build follower list string for logging
+                std::string followerList = "";
+                for (size_t i = 0; i < followers.size(); i++) {
+                    followerList += followers[i];
+                    if (i < followers.size() - 1) followerList += ", ";
+                }
+
+                log(INFO, "Appended " + std::to_string(timelineUpdates.size()) +
+                          " lines to timeline file for user " + poster +
+                          " (consumed from " + queueName + ")" +
+                          " - Followers in this cluster: [" + followerList + "]");
+            } else {
+                log(ERROR, "Failed to open timeline file for appending: " + timelineFile);
+            }
+
+            // Release semaphore lock
+            sem_post(fileSem);
+            sem_close(fileSem);
         }
     }
 
@@ -632,7 +867,7 @@ void RunServer(std::string coordIP, std::string coordPort, std::string port_no, 
             rabbitMQ.consumeUserLists();
             rabbitMQ.consumeClientRelations();
             //rabbitMQ.consumeTimelines();
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::this_thread::sleep_for(std::chrono::seconds(5));
             // you can modify this sleep period as per your choice
         } });
 
@@ -819,7 +1054,7 @@ void Heartbeat()
         std::string role = isMaster ? "Master" : "Slave";
 
         // Log heartbeat
-        log(INFO, "Heartbeat sent, Role: " + role);
+        //log(INFO, "Heartbeat sent, Role: " + role);
     } else {
         log(ERROR, "Heartbeat failed: " + status.error_message());
     }
