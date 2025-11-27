@@ -1025,11 +1025,21 @@ class SNSServiceImpl final : public SNSService::Service {
 
             if (follower_client != nullptr && follower_client->stream != nullptr) {
                 follower_client->stream->Write(incoming_message);
+                // Track this message to prevent duplicate from file monitor (for same-cluster followers)
+                std::string signature = std::to_string(incoming_message.timestamp().seconds()) + "|" +
+                                        incoming_message.username() + "|" +
+                                        incoming_message.msg();
+                std::lock_guard<std::mutex> lock(sent_messages_mutex);
+                sent_messages.insert(signature);
             }
         }
     }
 
     // Section 8: Cleanup when user disconnects
+    keep_monitoring = false;  // Stop the file monitor thread
+    if (file_monitor_thread.joinable()) {
+        file_monitor_thread.join();  // Wait for thread to finish
+    }
     user->stream = nullptr;
 
     return Status::OK;
