@@ -931,7 +931,7 @@ void RunServer(std::string coordIP, std::string coordPort, std::string port_no, 
             rabbitMQ.consumeUserLists();
             rabbitMQ.consumeClientRelations();
             rabbitMQ.consumeTimelines();
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            std::this_thread::sleep_for(std::chrono::seconds(2));
         } });
 
     server->Wait();
@@ -1026,7 +1026,7 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
     while (true)
     {
         // the synchronizers sync files every 5 seconds
-        sleep(5);
+        sleep(3);
 
         grpc::ClientContext context;
         ServerList followerServers;

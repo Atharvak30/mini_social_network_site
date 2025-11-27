@@ -105,6 +105,7 @@ std::string g_coordinatorPort;
 std::string g_serverPort;
 std::string g_serverDirectory;  // Directory where this server stores files
 bool g_isMaster = false;        // Is this server currently acting as Master?
+bool g_startedAsSlave = false;  // Did this server start as a Slave? (never changes, even if promoted)
 std::unique_ptr<CoordService::Stub> coordinator_stub_;
 std::unique_ptr<SNSService::Stub> slave_stub_;  // Master uses this to mirror to Slave
 
@@ -772,22 +773,45 @@ class SNSServiceImpl final : public SNSService::Service {
   // RPC Login
   Status Login(ServerContext* context, const Request* request, Reply* reply) override {
     std::string username = request->username();
-    // Check if user already exists and is connected
     std::string role = g_isMaster ? "Master" : "Slave";
     log(INFO, role + " received login request: " + username);
 
+    // Only check for already-connected users if this process started as a Master
+    // If started as Slave, skip check because connected status is stale from mirrored logins
+    if (!g_startedAsSlave) {
+        for (Client* client : client_db) {
+            if (client->username == username && client->connected) {
+                // User already logged in - FAIL
+                reply->set_msg("FAILURE_ALREADY_EXISTS");
+                log(INFO, "Rejecting re-login for already connected user: " + username);
+                return Status::OK;
+            }
+        }
+    } else {
+        log(INFO, "Skipping already-connected check (process started as Slave)");
+    }
+
+    // Check if user already exists (but not connected, or we're skipping the check)
+    Client* existing_client = nullptr;
     for (Client* client : client_db) {
-        if (client->username == username && client->connected) {
-            // User already logged in - FAIL
-            reply->set_msg("FAILURE_ALREADY_EXISTS");
-            return Status::OK;
+        if (client->username == username) {
+            existing_client = client;
+            break;
         }
     }
-    // User doesn't exist or isn't connected - create/reconnect
-    Client* new_client = new Client();
-    new_client->username = username;
-    new_client->connected = true;
-    client_db.push_back(new_client);
+
+    if (existing_client != nullptr) {
+        // User exists - just mark as connected
+        existing_client->connected = true;
+        log(INFO, "Reconnecting existing user: " + username);
+    } else {
+        // User doesn't exist - create new
+        Client* new_client = new Client();
+        new_client->username = username;
+        new_client->connected = true;
+        client_db.push_back(new_client);
+        log(INFO, "Creating new user: " + username);
+    }
 
     // Mirror to Slave if we're Master
     if (g_isMaster) {
@@ -1103,7 +1127,16 @@ void sendHeartbeat() {
 
     // Log result
     if (status.ok() && confirmation.status()) {
-        // Update role based on Coordinator's response
+        // Track initial role on first heartbeat (never changes even if promoted)
+        static bool firstHeartbeat = true;
+        if (firstHeartbeat) {
+            g_startedAsSlave = !confirmation.ismaster();
+            log(INFO, "Initial role determined - Started as: " +
+                      std::string(g_startedAsSlave ? "Slave" : "Master"));
+            firstHeartbeat = false;
+        }
+
+        // Update current role based on Coordinator's response (can change if promoted)
         g_isMaster = confirmation.ismaster();
 
         std::string role = g_isMaster ? "Master" : "Slave";
